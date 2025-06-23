@@ -8,12 +8,43 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import hashlib
 
 global pothole_cases_df, pavement_latlon_df, complaint_df # Declare globals here
 
-# ---------- App Configuration ----------
+# Helper function to convert numeric types in DataFrame to native Python types
+def _convert_dataframe_numerics_to_native_types(df):
+    for col in df.columns:
+        if pd.api.types.is_integer_dtype(df[col]):
+            df[col] = df[col].apply(lambda x: int(x) if pd.notna(x) else None)
+        elif pd.api.types.is_float_dtype(df[col]):
+            df[col] = df[col].apply(lambda x: float(x) if pd.notna(x) else None)
+    return df
+
+# Initialize chat history in session state to ensure it's always available before any access
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Set page configuration
 st.set_page_config(layout="wide")
-st.title('🗺️ Integrated Chat with Map')
+
+st.title("San Antonio Pothole Map & Chatbot")
+
+# Define map center and zoom level
+center = [29.358488, -98.626591]
+zoom_start = 10
+
+# Initialize the base map globally in session state, only once
+# if "m" not in st.session_state:
+#     st.session_state.m = folium.Map(location=center, zoom_start=zoom_start)
+#     st.session_state.highlight_feature_group = folium.FeatureGroup(name="Highlighted Streets").add_to(st.session_state.m)
+
+# Access the map and feature group from session state
+# m = st.session_state.m
+# highlight_feature_group = st.session_state.highlight_feature_group
 
 # ---------- Groq AI Configuration ----------
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -45,11 +76,14 @@ def load_pavement_data(path):
         def extract_lat_lon(url):
             if pd.isna(url) or url == 'Not Available':
                 return None, None
-            match = re.search(r'place/(-?\d+\.?\d*)[N|S]\s*(-?\d+\.?\d*)[E|W]', url)
+            match = re.search(r'place/(-?\d+\.?\d*)[NS]\s*(-?\d+\.?\d*)([EW])', url)
             if match:
                 lat = float(match.group(1))
-                lon = float(match.group(2))
-                if 'W' in match.group(2): # Adjust longitude sign if it's West
+                lon_numeric = float(match.group(2))
+                lon_direction = match.group(3)
+                
+                lon = lon_numeric
+                if lon_direction == 'W': # Adjust longitude sign if it's West
                     lon = -abs(lon)
                 return lat, lon
             return None, None
@@ -57,7 +91,7 @@ def load_pavement_data(path):
         df[['Latitude', 'Longitude']] = df['GoogleMapView'].apply(
             lambda x: pd.Series(extract_lat_lon(x))
         )
-        df.dropna(subset=['MSAG_Name', 'Latitude', 'Longitude'], inplace=True)
+        df = df.dropna(subset=['MSAG_Name', 'Latitude', 'Longitude'])
         # st.success(f"Successfully loaded and cleaned {os.path.basename(path)}")
         return df
     except Exception as e:
@@ -111,7 +145,7 @@ def get_monthly_pothole_count():
 
 def get_worst_pothole_streets():
     if pavement_latlon_df.empty:
-        return "I don't have pavement data to identify streets with the worst potholes. Please ensure the 'COSA_Pavement.csv' file is loaded correctly."
+        return "I don't have pavement data to identify streets with the worst potholes. Please ensure the 'COSA_Pavement.csv' file is loaded correctly.", None, pd.DataFrame()
 
     street_pci_avg = pavement_latlon_df.groupby('MSAG_Name')['PCI'].mean()
 
@@ -122,13 +156,28 @@ def get_worst_pothole_streets():
         response = "Here are the Top 10 streets with the worst road conditions (most prone to potholes):\n"
         for rank, (street_name, score) in enumerate(top_worst_streets_data.items()):
             response += f"{rank + 1}. {street_name} (Deterioration Score: {score:.2f})\n"
-        return response
+
+        # Create a bar chart for visualization
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.barplot(x=top_worst_streets_data.values, y=top_worst_streets_data.index, ax=ax, palette="viridis", hue=top_worst_streets_data.index, legend=False)
+        ax.set_title('Top 10 Streets with Worst Road Conditions')
+        ax.set_xlabel('Pavement Deterioration Score (100 - PCI)')
+        ax.set_ylabel('Street Name')
+        plt.tight_layout()
+
+        # Prepare highlight_data_df for map
+        highlight_data_df = pavement_latlon_df[pavement_latlon_df['MSAG_Name'].isin(top_worst_streets_data.index)].copy()
+        highlight_data_df = highlight_data_df.drop_duplicates(subset=['MSAG_Name'])
+        highlight_data_df = highlight_data_df[['MSAG_Name', 'Latitude', 'Longitude']]
+        highlight_data_df['color'] = 'darkblue' # Assign darkblue color for worst streets
+
+        return response, fig, highlight_data_df
     else:
-        return "No street-level road condition data available to identify worst streets."
+        return "No street-level road condition data available to identify worst streets.", None, pd.DataFrame()
 
 def get_top_complaint_locations():
     if complaint_df.empty:
-        return "I don't have complaint data to identify top locations. Please ensure the 'COSA_pavement_311.csv' file is loaded correctly."
+        return "I don't have complaint data to identify top locations. Please ensure the 'COSA_pavement_311.csv' file is loaded correctly.", None, pd.DataFrame()
 
     df_cosa_pavement_311_complaints = complaint_df.copy()
     df_cosa_pavement_311_complaints.dropna(subset=['MSAG_Name'], inplace=True)
@@ -139,13 +188,31 @@ def get_top_complaint_locations():
         response = "Here are the Top 10 most frequently reported complaint locations (streets, all types of complaints):\n"
         for rank, (street_name, count) in enumerate(top_10_complaint_locations.items()):
             response += f"{rank + 1}. {street_name}: {count} total reports\n"
-        return response
+
+        # Create a bar chart for visualization
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.barplot(x=top_10_complaint_locations.values, y=top_10_complaint_locations.index, ax=ax, palette="viridis", hue=top_10_complaint_locations.index, legend=False)
+        ax.set_title('Top 10 Most Frequently Reported Complaint Locations')
+        ax.set_xlabel('Number of Complaints')
+        ax.set_ylabel('Street Name')
+        plt.tight_layout()
+
+        # Prepare highlight_data_df for map: get lat/lon for top 10 complaint streets
+        # Merge with pavement_latlon_df to get coordinates
+        highlight_data_df = pd.DataFrame({'MSAG_Name': top_10_complaint_locations.index})
+        highlight_data_df = pd.merge(highlight_data_df, pavement_latlon_df[['MSAG_Name', 'Latitude', 'Longitude']],
+                                     on='MSAG_Name', how='left')
+        highlight_data_df = highlight_data_df.drop_duplicates(subset=['MSAG_Name'])
+        highlight_data_df = highlight_data_df.dropna(subset=['Latitude', 'Longitude'])
+        highlight_data_df['color'] = 'darkblue' # Assign darkblue color for top complaint locations
+
+        return response, fig, highlight_data_df
     else:
-        return "No valid street names found in the complaint data after cleaning."
+        return "No valid street names found in the complaint data after cleaning.", None, pd.DataFrame()
 
 def get_unresolved_complaints_by_year():
     if complaint_df.empty:
-        return "I don't have complaint data to determine unresolved complaints. Please ensure the 'COSA_pavement_311.csv' file is loaded correctly."
+        return "I don't have complaint data to determine unresolved complaints. Please ensure the 'COSA_pavement_311.csv' file is loaded correctly.", None, pd.DataFrame()
 
     df_complaints_yearly = complaint_df.copy()
     df_complaints_yearly['OPENEDDATETIME'] = pd.to_datetime(df_complaints_yearly['OPENEDDATETIME'], errors='coerce')
@@ -169,19 +236,19 @@ def get_unresolved_complaints_by_year():
                     response += f"Year {int(row['OpenedYear'])}: Total = {int(row['TotalComplaints'])}, Unresolved = {int(row['UnresolvedComplaints'])} ({percent_unresolved:.2f}%)\n"
                 else:
                     response += f"Year {int(row['OpenedYear'])}: No complaints reported.\n"
-            return response
+            return response, None, pd.DataFrame()
         else:
-            return "No complaints found to summarize by year."
+            return "No complaints found to summarize by year.", None, pd.DataFrame()
     else:
-        return "No valid complaint data with opened dates found after initial cleaning."
+        return "No valid complaint data with opened dates found after initial cleaning.", None, pd.DataFrame()
 
 def get_seasonal_pothole_impact():
     if complaint_df.empty:
-        return "I don't have complaint data to analyze seasonal impact on potholes. Please ensure the 'COSA_pavement_311.csv' file is loaded correctly."
+        return "I don't have complaint data to analyze seasonal impact on potholes. Please ensure the 'COSA_pavement_311.csv' file is loaded correctly.", None, pd.DataFrame()
 
     pothole_complaints_seasonal = complaint_df.copy()
     pothole_complaints_seasonal['Month'] = pothole_complaints_seasonal['OPENEDDATETIME'].dt.month
-    pothole_complaints_seasonal.dropna(subset=['Month'], inplace=True)
+    pothole_complaints_seasonal = pothole_complaints_seasonal.dropna(subset=['Month'])
 
     if not pothole_complaints_seasonal.empty:
         monthly_complaints_potholes = pothole_complaints_seasonal.groupby('Month').size().reset_index(name='Total_Complaints')
@@ -193,13 +260,22 @@ def get_seasonal_pothole_impact():
         for index, row in monthly_complaints_potholes.iterrows():
             response += f"{row['Month_Name']}: {row['Total_Complaints']} complaints\n"
         response += "\nTypically, increased precipitation and freeze-thaw cycles (large temperature differences) in winter/early spring contribute to more potholes."
-        return response
+        
+        # Create a line plot for seasonal trends
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.lineplot(x='Month_Name', y='Total_Complaints', data=monthly_complaints_potholes, marker='o', ax=ax)
+        ax.set_title('Seasonal Trend of Road-Related Complaints')
+        ax.set_xlabel('Month')
+        ax.set_ylabel('Total Complaints')
+        plt.tight_layout()
+
+        return response, fig, pd.DataFrame() # No specific highlight data for this plot
     else:
-        return "No road-related complaints found for seasonal analysis."
+        return "No road-related complaints found for seasonal analysis.", None, pd.DataFrame()
 
 def get_pothole_formation_prediction():
     if pavement_latlon_df.empty or complaint_df.empty:
-        return "I need both pavement and complaint data to predict pothole formation. Please ensure 'COSA_Pavement.csv' and 'COSA_pavement_311.csv' are loaded correctly."
+        return "I need both pavement and complaint data to predict pothole formation. Please ensure 'COSA_Pavement.csv' and 'COSA_pavement_311.csv' are loaded correctly.", None, pd.DataFrame()
 
     # 1. Calculate Average PCI and Road Deterioration Score per MSAG_Name
     pci_by_msag = pavement_latlon_df.groupby('MSAG_Name')['PCI'].mean().reset_index()
@@ -220,16 +296,16 @@ def get_pothole_formation_prediction():
     if pd.isna(latest_data_date):
         latest_data_date = datetime.now()
     latest_install_date['Maintenance_Age_Years'] = (latest_data_date - latest_install_date['InstallDate']).dt.days / 365.25
-    latest_install_date['Maintenance_Age_Years'].fillna(latest_install_date['Maintenance_Age_Years'].max() * 2, inplace=True)
+    latest_install_date['Maintenance_Age_Years'] = latest_install_date['Maintenance_Age_Years'].fillna(latest_install_date['Maintenance_Age_Years'].max() * 2)
 
     # 4. Merge all relevant dataframes
     pothole_risk_df = pd.merge(pci_by_msag, recent_complaint_counts, on='MSAG_Name', how='outer')
     pothole_risk_df = pd.merge(pothole_risk_df, latest_install_date[['MSAG_Name', 'Maintenance_Age_Years']], on='MSAG_Name', how='outer')
 
     # Fill NaN values
-    pothole_risk_df['Road_Deterioration_Score'].fillna(pothole_risk_df['Road_Deterioration_Score'].mean(), inplace=True)
-    pothole_risk_df['Recent_Complaint_Count'].fillna(0, inplace=True)
-    pothole_risk_df['Maintenance_Age_Years'].fillna(pothole_risk_df['Maintenance_Age_Years'].max(), inplace=True)
+    pothole_risk_df['Road_Deterioration_Score'] = pothole_risk_df['Road_Deterioration_Score'].fillna(pothole_risk_df['Road_Deterioration_Score'].mean())
+    pothole_risk_df['Recent_Complaint_Count'] = pothole_risk_df['Recent_Complaint_Count'].fillna(0)
+    pothole_risk_df['Maintenance_Age_Years'] = pothole_risk_df['Maintenance_Age_Years'].fillna(pothole_risk_df['Maintenance_Age_Years'].max())
 
     # 5. Create a composite Pothole Formation Risk Score (normalize and sum)
     for col in ['Road_Deterioration_Score', 'Recent_Complaint_Count', 'Maintenance_Age_Years']:
@@ -252,167 +328,175 @@ def get_pothole_formation_prediction():
     response = "Predicted Top 10 Areas for New Pothole Formation in the next 2 years (Higher Score = Higher Risk):\n"
     for index, row in top_risk_areas.iterrows():
         response += f"{index + 1}. {row['MSAG_Name']}: Risk Score = {row['Pothole_Formation_Risk_Score']:.2f} (Deterioration: {row['Road_Deterioration_Score']:.2f}, Recent Complaints: {int(row['Recent_Complaint_Count'])}, Maint. Age: {row['Maintenance_Age_Years']:.1f} yrs)\n"
-    return response
+    
+    # Create a bar chart for predicted pothole formation risk
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.barplot(x='Pothole_Formation_Risk_Score', y='MSAG_Name', data=top_risk_areas, ax=ax, palette="coolwarm", hue='MSAG_Name', legend=False)
+    ax.set_title('Top 10 Areas for Pothole Formation Prediction')
+    ax.set_xlabel('Pothole Formation Risk Score')
+    ax.set_ylabel('Street Name')
+    plt.tight_layout()
+
+    # Prepare highlight_data_df for map
+    highlight_data_df = pd.merge(top_risk_areas, pavement_latlon_df[['MSAG_Name', 'Latitude', 'Longitude']],
+                                 on='MSAG_Name', how='left')
+    highlight_data_df = highlight_data_df.drop_duplicates(subset=['MSAG_Name'])
+    highlight_data_df = highlight_data_df.dropna(subset=['Latitude', 'Longitude'])
+
+    # Ensure numeric columns are standard Python types for JSON serialization
+    for col in ['Latitude', 'Longitude', 'Pothole_Formation_Risk_Score', 'Road_Deterioration_Score', 'Recent_Complaint_Count', 'Maintenance_Age_Years']:
+        if col in highlight_data_df.columns:
+            if highlight_data_df[col].dtype == 'float64':
+                highlight_data_df[col] = highlight_data_df[col].astype(float)
+            elif highlight_data_df[col].dtype == 'int64':
+                highlight_data_df[col] = highlight_data_df[col].astype(int)
+
+    highlight_data_df['color'] = 'darkblue' # Assign darkblue color for predicted risk
+    highlight_data_df['marker_radius'] = 15 # Assign radius 15 for predicted risk
+
+    return response, fig, highlight_data_df
 
 def get_groq_response(prompt):
     prompt_lower = prompt.lower()
+    plot_object = None
+    highlight_data_df = pd.DataFrame() # Initialize empty DataFrame for map highlighting
 
     # Check for new, more specific analytical questions
     if "pavement condition for" in prompt_lower or "potholes on" in prompt_lower:
         match = re.search(r'(pavement condition for|potholes on)\s+(.+)', prompt_lower)
         if match:
             street_name = match.group(2).strip()
-            return get_pavement_condition_prediction(street_name)
+            response_text = get_pavement_condition_prediction(street_name)
+            return response_text, plot_object, highlight_data_df
     if "how many potholes this month" in prompt_lower or "monthly pothole count" in prompt_lower:
-        return get_monthly_pothole_count()
+        response_text = get_monthly_pothole_count()
+        return response_text, plot_object, highlight_data_df
     if "worst potholes" in prompt_lower or "streets with bad roads" in prompt_lower:
-        return get_worst_pothole_streets()
+        response_text, plot_object, highlight_data_df = get_worst_pothole_streets()
+        return response_text, plot_object, highlight_data_df
     if "top complaint locations" in prompt_lower or "most reported streets" in prompt_lower:
-        return get_top_complaint_locations()
+        response_text, plot_object, highlight_data_df = get_top_complaint_locations()
+        return response_text, plot_object, highlight_data_df
     if "unresolved complaints" in prompt_lower or "open complaints by year" in prompt_lower:
-        return get_unresolved_complaints_by_year()
+        response_text, plot_object, highlight_data_df = get_unresolved_complaints_by_year()
+        return response_text, plot_object, highlight_data_df
     if "seasonal impact on potholes" in prompt_lower or "potholes by season" in prompt_lower:
-        return get_seasonal_pothole_impact()
+        response_text, plot_object, highlight_data_df = get_seasonal_pothole_impact()
+        return response_text, plot_object, highlight_data_df
     if "predict new potholes" in prompt_lower or "pothole formation prediction" in prompt_lower or "where will new potholes form" in prompt_lower:
-        return get_pothole_formation_prediction()
+        response_text, plot_object, highlight_data_df = get_pothole_formation_prediction()
+        return response_text, plot_object, highlight_data_df
 
-    # Keyword-based logic based on Visualization.ipynb insights
+    # Keyword-based logic
     keyword_responses = {
-        "how many potholes": f"There are {len(my_subset)} potholes recorded in the dataset.",
-        "number of potholes": f"The dataset contains {len(my_subset)} potholes.",
+        "how many potholes": f"There are {len(pothole_cases_df.index) if not pothole_cases_df.empty else 'no'} potholes recorded in the dataset.",
+        "number of potholes": f"The dataset contains {len(pothole_cases_df.index) if not pothole_cases_df.empty else 'no'} potholes.",
         "pavement condition": "Pavement condition ratings were joined with pothole data to analyze correlation.",
         "correlation": "The correlation matrix visualizes relationships among Vibration, Speed, and Acceleration.",
         "heatmap": "The heatmap shows which features are strongly related, such as Vibration vs Speed.",
-        "scatter": "The scatter plot visualizes Speed vs Acceleration and uses color to represent Vibration.",
-        "vibration": "Vibration data can be used to detect uneven road surfaces and possible potholes.",
-        "acceleration": "Acceleration measures help identify rapid speed changes, useful for rough patch detection.",
-        "speed": "Speed is a key feature used to assess road behavior and potential hazards.",
-        "latitude" or "longitude": "GPS coordinates are used to map pothole locations on a Folium map.",
-        "map" or "folium": "The Folium map is used to visualize pothole data with markers based on GPS coordinates.",
-        "time series": "The notebook shows monthly and yearly trends of pothole cases using line plots.",
-        "monthly trend": "Monthly pothole reports were visualized using time series plots to detect peaks.",
-        "yearly trend": "The data was grouped by year to identify whether potholes are increasing or decreasing.",
-        "merge": "Two datasets—pothole reports and pavement ratings—were merged on location info.",
-        "dataset" or "data columns": "The pothole dataset includes date, latitude, longitude, severity, and more.",
-        "missing values": "Missing values in location and date fields were handled during preprocessing."
+        "scatter plot": "The scatter plot illustrates the distribution of potholes based on latitude and longitude.",
+        "vibration data": "Vibration data, collected by sensors, helps in assessing road roughness and potential pothole formation.",
+        "acceleration relate": "Acceleration data can indicate sudden jolts or bumps, which are signs of poor road conditions or potholes.",
+        "speed data": "Speed data helps understand how vehicle speed interacts with road conditions, affecting the impact of potholes.",
+        "latitude and longitude": "Latitude and longitude provide the precise geographical location of potholes and road segments for mapping.",
+        "map or folium": "The Folium map displays potholes and road conditions, allowing for interactive geographical analysis.",
+        "time series": "The time series chart visualizes the trend of pothole incidents over time, identifying patterns.",
+        "monthly trends": "Monthly trends show fluctuations in pothole reports throughout the year, highlighting peak seasons.",
+        "yearly trends": "Yearly trends provide an overview of pothole incidents across different years, indicating long-term changes.",
+        "datasets merged": "Various datasets, including 311 service requests, pavement conditions, and sensor data, were merged for comprehensive analysis.",
+        "dataset or data columns": "The datasets include columns such as Service Request Type, Latitude, Longitude, Open Date, Close Date, MSAG Name, PCI, etc.",
+        "missing values": "Missing values in datasets were handled through imputation or removal, depending on the extent and impact of the missing data."
     }
 
-    # Respond using keyword matches
-    for keyword, response in keyword_responses.items():
+    # Fallback to Groq API for general questions
+    response_text = None
+    for keyword, resp in keyword_responses.items():
         if keyword in prompt_lower:
-            return response
+            response_text = resp
+            break
 
-    # Fallback to Groq API for other prompts
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    if response_text is None:
+        try:
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "model": "llama3-8b-8192",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 150,
+            }
+            groq_response = requests.post(GROQ_API_URL, headers=headers, json=data)
+            groq_response.raise_for_status() # Raise an exception for HTTP errors
+            response_data = groq_response.json()
+            response_text = response_data["choices"][0]["message"]["content"]
+        except requests.exceptions.RequestException as e:
+            st.error(f"Error communicating with Groq API: {e}")
+            response_text = "I am currently unable to connect to the Groq AI. Please try again later."
+        except KeyError:
+            response_text = "I received an unexpected response from the Groq AI. Please try rephrasing your question."
 
-    data = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    # Convert numeric types in highlight_data_df to native Python types for JSON serialization
+    if not highlight_data_df.empty:
+        highlight_data_df = _convert_dataframe_numerics_to_native_types(highlight_data_df)
+    
+    return response_text, plot_object, highlight_data_df
 
-    try:
-        response = requests.post(GROQ_API_URL, headers=headers, json=data)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Error: {str(e)}"
+# Function to plot markers on the map
+def plot_from_df(df, folium_map):
+    """
+    Function to plot markers on the map
+    Args:
+        df (DataFrame): Data containing coordinates
+        folium_map (Map): Folium map object
+    Returns:
+        Map: Updated map with markers
+    """
+    for i, row in df.iterrows():
+        folium.Marker(
+            location=[row.Latitude, row.Longitude],
+            tooltip=f"Location {i}",
+            icon=folium.Icon(color='red', icon='info-sign')
+        ).add_to(folium_map)
+    return folium_map
 
-# ---------- Load and Plot Map ----------
-try:
-    my_subset = gpd.read_file("integrated_prototype/potholes_data.gpkg", layer="potholes")
-    small_df = my_subset.head(10)
-
-    def plot_from_df(df, folium_map):
-        """
-        Function to plot markers on the map
-        Args:
-            df (DataFrame): Data containing coordinates
-            folium_map (Map): Folium map object
-        Returns:
-            Map: Updated map with markers
-        """
-        for i, row in df.iterrows():
-            folium.Marker(
+def add_pothole_markers(df, folium_map, feature_group, color_column='color', marker_radius=8):
+    for _, row in df.iterrows():
+        if pd.notna(row['Latitude']) and pd.notna(row['Longitude']):
+            marker_color = row[color_column] if color_column in row else 'blue' # Default to blue if no color column
+            folium.CircleMarker(
                 location=[row.Latitude, row.Longitude],
-                tooltip=f"Location {i}",
-                icon=folium.Icon(color='red', icon='info-sign')
-            ).add_to(folium_map)
-        return folium_map
+                radius=int(marker_radius),  # Ensure radius is a standard Python int
+                color=marker_color,
+                fill=True,
+                fill_color=marker_color,
+                fill_opacity=0.7,
+                tooltip=f"{row['MSAG_Name']}: {row.get('ComplaintCount', 'N/A')} Complaints",
+            ).add_to(feature_group)
+    return feature_group # Return the feature group
 
-    center = [29.358488, -98.626591]
-    zoom_start = 10
-    m = plot_from_df(small_df, folium.Map(location=center, zoom_start=zoom_start))
+# --- Load additional datasets for chatbot analysis ---
+# Define paths relative to the integrated.py file
+data_folder_path = "Data"
 
-    # --- Load additional datasets for chatbot analysis ---
-    # Define paths relative to the integrated.py file
-    data_folder_path = os.path.join(os.path.dirname(__file__), "..", "Data")
+pothole_cases_path = os.path.join(data_folder_path, "311_Pothole_Cases_18_24.csv")
+pavement_path = os.path.join(data_folder_path, "COSA_Pavement.csv")
+complaint_full_path = os.path.join(data_folder_path, "COSA_pavement_311.csv")
 
-    pothole_cases_path = os.path.join(data_folder_path, "311_Pothole_Cases_18_24.csv")
-    pavement_path = os.path.join(data_folder_path, "COSA_Pavement.csv")
-    complaint_full_path = os.path.join(data_folder_path, "COSA_pavement_311.csv")
+try:
+    pothole_cases_df = load_pothole_cases_data(pothole_cases_path)
+    pavement_latlon_df = load_pavement_data(pavement_path)
+    complaint_df = load_complaint_data(complaint_full_path)
 
-    try:
-        pothole_cases_df = load_pothole_cases_data(pothole_cases_path)
-        pavement_latlon_df = load_pavement_data(pavement_path)
-        complaint_df = load_complaint_data(complaint_full_path)
-
-    except Exception as e:
-        st.error(f"An error occurred while loading additional data: {e}")
-        st.info("Some chatbot features related to detailed data analysis may be unavailable.")
-
-    # ---------- Layout ----------
-    col1, col2 = st.columns([3, 1])
-
-    # -- Main Map Area --
-    with col1:
-        st.markdown("### Pothole Map")
-        st_data = st_folium(m, width=900, height=500)
-
-    # -- Chatbot Sidebar --
-    with col2:
-        st.markdown("### Chatbot")
-        messages = st.container(height=300)
-        
-        # Initialize chat history in session state
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-
-        # Display chat history
-        for message in st.session_state.messages:
-            with messages.chat_message(message["role"]):
-                st.write(message["content"])
-
-        # Chat input and response handling
-        if prompt := st.chat_input("Ask about potholes or road conditions"):
-            # Add user message to chat history
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with messages.chat_message("user"):
-                st.write(prompt)
-
-            # Get response from Groq AI
-            response = get_groq_response(prompt)
-            
-            # Add assistant response to chat history
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            with messages.chat_message("assistant"):
-                st.write(response)
-
-except FileNotFoundError:
-    st.error("Error: potholes_data.gpkg file not found. Please ensure the file is in the correct location.")
-    st.info("The map visualization is currently unavailable. However, you can still use the chatbot feature.")
+except Exception as e:
+    st.error(f"An error occurred while loading additional data: {e}")
+    st.info("Some chatbot features related to detailed data analysis may be unavailable.")
     
     # Show only the chatbot if map data is missing
     st.markdown("### Chatbot")
     messages = st.container(height=300)
-    
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
 
-    # Display chat history
+    # Display chat history (already initialized at the top)
     for message in st.session_state.messages:
         with messages.chat_message(message["role"]):
             st.write(message["content"])
@@ -424,15 +508,134 @@ except FileNotFoundError:
             st.write(prompt)
 
         # Get response from Groq AI
-        response = get_groq_response(prompt)
+        response_text, plot_object, highlight_data_df = get_groq_response(prompt)
         
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        # Convert numeric types in highlight_data_df to native Python types for JSON serialization
+        if not highlight_data_df.empty:
+            highlight_data_df = _convert_dataframe_numerics_to_native_types(highlight_data_df)
+
+        # Add assistant response to chat history, storing plot and highlight data
+        message_entry = {
+            "role": "assistant",
+            "content": response_text,
+            "vis_data": {
+                "plot_object": plot_object,
+                "highlight_data_df": highlight_data_df.to_dict('records') if not highlight_data_df.empty else []
+            },
+            "prompt": prompt # Keep prompt for re-running visualizations if needed
+        }
+        st.session_state.messages.append(message_entry)
         with messages.chat_message("assistant"):
-            st.write(response)
+            st.write(response_text)
+            if plot_object is not None:
+                st.pyplot(plot_object)
+                plt.close(plot_object) # Ensure plot is closed after display for new responses
+    st.stop() # Stop execution if data loading failed and only chatbot is available
 
+# ---------- Layout ----------
+col1, col2 = st.columns([3, 1])
 
+# -- Main Map Area --
+with col1:
+    st.markdown("### Pothole Map")
+    
+    # Use st.empty() to control the map's rendering lifecycle explicitly
+    map_placeholder = st.empty()
 
+    # Create a new map object and its layers within the placeholder
+    with map_placeholder.container():
+        current_map = folium.Map(location=center, zoom_start=zoom_start)
+
+        current_highlight_feature_group = folium.FeatureGroup(name="Highlighted Streets")
+
+        if st.session_state.messages:
+            latest_message = st.session_state.messages[-1]
+            
+            if latest_message.get("vis_data") and latest_message["vis_data"].get("highlight_data_df"):
+                latest_highlight_df = pd.DataFrame(latest_message["vis_data"]["highlight_data_df"])
+                
+                if not latest_highlight_df.empty:
+                    # If not, it will use the default value from the function definition
+                    add_pothole_markers(
+                        latest_highlight_df,
+                        current_map,
+                        current_highlight_feature_group,
+                        color_column='color',
+                        marker_radius=latest_highlight_df['marker_radius'].iloc[0] if 'marker_radius' in latest_highlight_df.columns else 8
+                    )
+            
+            current_highlight_feature_group.add_to(current_map)
+
+        # Use a simple key for now; if it still doesn't update, we can make it dynamic based on content
+        map_key = f"folium_map_initial"
+        if st.session_state.messages:
+            latest_message = st.session_state.messages[-1]
+            # Create a copy of vis_data and remove plot_object before JSON serialization
+            vis_data_for_key = latest_message.get("vis_data", {}).copy()
+            if "plot_object" in vis_data_for_key:
+                del vis_data_for_key["plot_object"]
+            latest_vis_data_json = json.dumps(vis_data_for_key, sort_keys=True)
+            latest_vis_data_hash = hashlib.md5(latest_vis_data_json.encode()).hexdigest()
+            map_key = f"folium_map_{len(st.session_state.messages)}_{latest_vis_data_hash}"
+
+        st_data = st_folium(current_map, width=900, height=500, key=map_key)
+
+# -- Chatbot Sidebar --
+with col2:
+    st.markdown("### Chatbot")
+    messages = st.container(height=300)
+
+    # Display chat history with permanent visualizations
+    for i, message in enumerate(st.session_state.messages):
+        with messages.chat_message(message["role"]):
+            st.write(message["content"])
+            if message["role"] == "assistant" and message.get("vis_data"):
+                plot_obj = message["vis_data"].get("plot_object")
+                highlight_df_dict = message["vis_data"].get("highlight_data_df")
+                highlight_df = pd.DataFrame(highlight_df_dict) if highlight_df_dict else pd.DataFrame()
+
+                if plot_obj is not None:
+                    st.pyplot(plot_obj)
+                    plt.close(plot_obj)
+
+                # Map highlight logic is now before main map rendering
+                # No st_folium call here for historical maps in chatbot
+
+    # Chat input and response handling
+    if prompt := st.chat_input("Ask about potholes or road conditions"):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with messages.chat_message("user"):
+            st.write(prompt)
+
+        # Get response from Groq AI
+        response_text, plot_object, highlight_data_df = get_groq_response(prompt)
+        
+        # Convert numeric types in highlight_data_df to native Python types for JSON serialization
+        if not highlight_data_df.empty:
+            highlight_data_df = _convert_dataframe_numerics_to_native_types(highlight_data_df)
+
+        # Add assistant response to chat history, storing plot and highlight data
+        message_entry = {
+            "role": "assistant",
+            "content": response_text,
+            "vis_data": {
+                "plot_object": plot_object,
+                "highlight_data_df": highlight_data_df.to_dict('records') if not highlight_data_df.empty else []
+            },
+            "prompt": prompt # Keep prompt for re-running visualizations if needed
+        }
+        st.session_state.messages.append(message_entry)
+        with messages.chat_message("assistant"):
+            st.write(response_text)
+            if plot_object is not None:
+                st.pyplot(plot_object)
+                plt.close(plot_object) # Ensure plot is closed after display for new responses
+
+            # Map highlight logic is now handled before main map rendering
+            # No st_folium call here for new responses in chatbot
+
+# You can try these questions in your Streamlit application!
 # General Pothole & Map Information:
 # "How many potholes?"
 # "Number of potholes"
@@ -474,4 +677,3 @@ except FileNotFoundError:
 # "Predict new potholes."
 # "What's the pothole formation prediction?"
 # "Where will new potholes form?"
-# You can try these questions in your Streamlit application!
