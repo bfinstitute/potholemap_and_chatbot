@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import hashlib
+from functools import lru_cache
 
 global pothole_cases_df, pavement_latlon_df, complaint_df # Declare globals here
 
@@ -54,6 +55,184 @@ GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 pothole_cases_df = pd.DataFrame()
 pavement_latlon_df = pd.DataFrame()
 complaint_df = pd.DataFrame()
+
+# --- DATA STUBS FOR EXTERNAL DATASETS (replace with real data as available) ---
+# Example: schools_df = pd.read_csv('Data/schools.csv')
+schools_df = pd.DataFrame(columns=['name', 'lat', 'lon'])  # TODO: Replace with real school data
+hospitals_df = pd.DataFrame(columns=['name', 'lat', 'lon'])  # TODO: Replace with real hospital data
+senior_centers_df = pd.DataFrame(columns=['name', 'lat', 'lon'])  # TODO: Replace with real senior center data
+injuries_df = pd.DataFrame(columns=['intersection', 'lat', 'lon', 'injury_count'])  # TODO: Replace with real injury data
+
+# --- Load VIA stops and routes ---
+via_stops_df = pd.read_csv('Data/VIA/stops_cleaned.csv')
+via_routes_df = pd.read_csv('Data/VIA/via_routes_cleaned.csv')
+
+# --- Utility: Geospatial join (point-in-radius) ---
+def points_within_radius(points_df, center_lat, center_lon, radius_m):
+    gdf_points = gpd.GeoDataFrame(points_df.copy(), geometry=gpd.points_from_xy(points_df.lon, points_df.lat), crs='EPSG:4326')
+    center = gpd.GeoSeries([gpd.points_from_xy([center_lon], [center_lat])[0]], crs='EPSG:4326').to_crs(epsg=3857)
+    gdf_points_proj = gdf_points.to_crs(epsg=3857)
+    buffer = center.buffer(radius_m)
+    return gdf_points_proj[gdf_points_proj.geometry.within(buffer.iloc[0])]
+
+# --- Utility: Fast Geocoding with Caching ---
+def geocode_address(address):
+    @st.cache_data(show_spinner=False)
+    def _geocode(addr):
+        url = f"https://nominatim.openstreetmap.org/search"
+        params = {"q": addr, "format": "json", "limit": 1}
+        try:
+            resp = requests.get(url, params=params, headers={"User-Agent": "pothole-bot"}, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
+        except Exception:
+            return None, None
+        return None, None
+    return _geocode(address)
+
+# --- Utility: Convert pavement_latlon_df to GeoDataFrame ---
+def get_pavement_gdf():
+    if not hasattr(get_pavement_gdf, "gdf"):
+        if not pavement_latlon_df.empty and "Latitude" in pavement_latlon_df.columns and "Longitude" in pavement_latlon_df.columns:
+            gdf = gpd.GeoDataFrame(
+                pavement_latlon_df.copy(),
+                geometry=gpd.points_from_xy(pavement_latlon_df.Longitude, pavement_latlon_df.Latitude),
+                crs="EPSG:4326"
+            )
+            get_pavement_gdf.gdf = gdf
+        else:
+            get_pavement_gdf.gdf = gpd.GeoDataFrame()
+    return get_pavement_gdf.gdf
+
+# --- Handler: Active pothole complaints near school zones, senior centers, hospitals ---
+def handle_active_complaints_near_sensitive_areas(radius_m=300):
+    # Filter unresolved complaints (active)
+    if complaint_df.empty or 'Latitude' not in complaint_df.columns or 'Longitude' not in complaint_df.columns:
+        return "Complaint data with location is required for this analysis.", None, pd.DataFrame()
+    unresolved = complaint_df[complaint_df['CLOSEDDATETIME'].isna() & complaint_df['Latitude'].notna() & complaint_df['Longitude'].notna()]
+    # Combine all sensitive locations
+    sensitive = pd.concat([
+        schools_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'}),
+        hospitals_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'}),
+        senior_centers_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'})
+    ], ignore_index=True)
+    if sensitive.empty:
+        return "No sensitive location data (schools, hospitals, senior centers) available.", None, pd.DataFrame()
+    # For each sensitive location, find complaints within radius
+    results = []
+    for _, row in sensitive.iterrows():
+        near = unresolved[((unresolved['Latitude'] - row['Latitude'])**2 + (unresolved['Longitude'] - row['Longitude'])**2).pow(0.5) < (radius_m/111320)]
+        for _, c in near.iterrows():
+            results.append({
+                'Sensitive': row['name'],
+                'ComplaintID': c.get('ComplaintID', ''),
+                'Latitude': c['Latitude'],
+                'Longitude': c['Longitude']
+            })
+    if not results:
+        return "No active pothole complaints found near school zones, senior centers, or hospitals.", None, pd.DataFrame()
+    highlight_df = pd.DataFrame(results)
+    highlight_df['color'] = 'red'
+    highlight_df['marker_radius'] = 10
+    return f"Found {len(highlight_df)} active pothole complaints near sensitive areas.", None, highlight_df
+
+# --- Handler: Intersections with VIA stops, high pothole & injury rates ---
+def handle_intersections_via_pothole_injury(top_n=5):
+    # Stub: join stops, complaints, and injuries at intersections
+    if injuries_df.empty or via_stops_df.empty or complaint_df.empty:
+        return "Required data (injuries, VIA stops, complaints) not available.", None, pd.DataFrame()
+    # For demo: just return a stub message
+    return "This analysis requires intersection and injury data. Please provide a dataset with intersection locations and injury counts.", None, pd.DataFrame()
+
+# --- Handler: Prioritize maintenance for bus damage/delays ---
+def handle_prioritize_maintenance_for_buses():
+    # Overlay VIA routes, complaint density, and PCI
+    if via_routes_df.empty or pavement_latlon_df.empty or complaint_df.empty:
+        return "Required data (VIA routes, pavement, complaints) not available.", None, pd.DataFrame()
+    # For demo: just return a stub message
+    return "This analysis requires VIA route geometry and pavement condition data. Please provide route shapes and PCI scores.", None, pd.DataFrame()
+
+# --- Handler: History of repeated pothole complaints along a road ---
+def handle_repeated_complaints_on_road(road):
+    if complaint_df.empty or 'MSAG_Name' not in complaint_df.columns:
+        return "Complaint data with road names is required.", None, pd.DataFrame()
+    road_complaints = complaint_df[complaint_df['MSAG_Name'].str.contains(road, case=False, na=False)]
+    if road_complaints.empty:
+        return f"No complaints found for road '{road}'.", None, pd.DataFrame()
+    trend = road_complaints.groupby(road_complaints['OPENEDDATETIME'].dt.to_period('M')).size()
+    response = f"Complaint history for {road}:\n" + '\n'.join([f"{str(idx)}: {val}" for idx, val in trend.items()])
+    return response, None, pd.DataFrame()
+
+# --- Handler: Bus stops near high-risk pavement ---
+def handle_bus_stops_near_high_risk_pavement(pci_threshold=50, radius_m=100):
+    if via_stops_df.empty or pavement_latlon_df.empty:
+        return "VIA stops and pavement data required.", None, pd.DataFrame()
+    high_risk = pavement_latlon_df[pavement_latlon_df['PCI'] < pci_threshold]
+    if high_risk.empty:
+        return "No high-risk pavement segments found.", None, pd.DataFrame()
+    results = []
+    for _, stop in via_stops_df.iterrows():
+        near = high_risk[((high_risk['Latitude'] - stop['stop_lat'])**2 + (high_risk['Longitude'] - stop['stop_lon'])**2).pow(0.5) < (radius_m/111320)]
+        for _, seg in near.iterrows():
+            results.append({'Stop': stop['stop_name'], 'Latitude': seg['Latitude'], 'Longitude': seg['Longitude']})
+    if not results:
+        return "No bus stops found near high-risk pavement.", None, pd.DataFrame()
+    highlight_df = pd.DataFrame(results)
+    highlight_df['color'] = 'purple'
+    highlight_df['marker_radius'] = 10
+    return f"Found {len(highlight_df)} bus stops near high-risk pavement.", None, highlight_df
+
+# --- Handler: Will I face potholes on the way to [area]? ---
+def handle_potholes_on_route(destination, origin="San Antonio, TX", buffer_m=50):
+    lat1, lon1 = geocode_address(origin)
+    lat2, lon2 = geocode_address(destination)
+    if None in (lat1, lon1, lat2, lon2):
+        return f"Could not geocode the route from '{origin}' to '{destination}'.", None, pd.DataFrame()
+    osrm_url = f"http://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
+    try:
+        resp = requests.get(osrm_url, timeout=5)
+        resp.raise_for_status()
+        route = resp.json()["routes"][0]["geometry"]["coordinates"]
+        route_points = [gpd.points_from_xy([pt[0]], [pt[1]])[0] for pt in route]
+        route_line = gpd.GeoSeries([gpd.GeoSeries(route_points).union_all().convex_hull], crs="EPSG:4326")
+        route_proj = route_line.to_crs(epsg=3857)
+        route_buffer = route_proj.buffer(buffer_m)
+        gdf = get_pavement_gdf()
+        if gdf.empty:
+            return "No pavement location data available.", None, pd.DataFrame()
+        gdf_proj = gdf.to_crs(epsg=3857)
+        on_route = gdf_proj[gdf_proj.geometry.within(route_buffer.iloc[0])]
+        count = len(on_route)
+        if count == 0:
+            return f"No potholes found along the route to '{destination}'.", None, pd.DataFrame()
+        highlight_df = on_route.to_crs(epsg=4326)[["Latitude", "Longitude", "MSAG_Name"]].copy()
+        highlight_df["color"] = "purple"
+        highlight_df["marker_radius"] = 10
+        return f"There are {count} pothole(s) along the route to '{destination}'.", None, highlight_df
+    except Exception:
+        return "Could not retrieve route information. Please try again later.", None, pd.DataFrame()
+
+# --- Handler: Are there potholes near [address]? ---
+def handle_potholes_near_address(address, radius_m=500):
+    lat, lon = geocode_address(address)
+    if lat is None or lon is None:
+        return f"Could not geocode the address '{address}'. Please check the address and try again.", None, pd.DataFrame()
+    gdf = get_pavement_gdf()
+    if gdf.empty:
+        return "No pavement location data available.", None, pd.DataFrame()
+    gdf_proj = gdf.to_crs(epsg=3857)
+    point = gpd.GeoSeries([gpd.points_from_xy([lon], [lat])[0]], crs="EPSG:4326").to_crs(epsg=3857)
+    buffer = point.buffer(radius_m)
+    nearby = gdf_proj[gdf_proj.geometry.within(buffer.iloc[0])]
+    count = len(nearby)
+    if count == 0:
+        return f"No potholes found within {radius_m} meters of '{address}'.", None, pd.DataFrame()
+    highlight_df = nearby.to_crs(epsg=4326)[["Latitude", "Longitude", "MSAG_Name"]].copy()
+    highlight_df["color"] = "red"
+    highlight_df["marker_radius"] = 10
+    return f"Found {count} pothole(s) within {radius_m} meters of '{address}'.", None, highlight_df
 
 # --- Analysis Functions (from Visualization.ipynb) ---
 
@@ -356,11 +535,226 @@ def get_pothole_formation_prediction():
 
     return response, fig, highlight_data_df
 
+# --- Handler: Area-specific pothole formation prediction ---
+def handle_pothole_formation_prediction_area(area):
+    if pavement_latlon_df.empty or complaint_df.empty:
+        return "I need both pavement and complaint data to predict pothole formation. Please ensure 'COSA_Pavement.csv' and 'COSA_pavement_311.csv' are loaded correctly.", None, pd.DataFrame()
+    # 1. Calculate Average PCI and Road Deterioration Score per MSAG_Name
+    pci_by_msag = pavement_latlon_df.groupby('MSAG_Name')['PCI'].mean().reset_index()
+    pci_by_msag['Road_Deterioration_Score'] = 100 - pci_by_msag['PCI']
+    # 2. Calculate Recent Complaint Count per MSAG_Name
+    current_year = datetime.now().year
+    recent_complaints_period = complaint_df[
+        (complaint_df['OPENEDDATETIME'].dt.year >= current_year - 2) &
+        (complaint_df['OPENEDDATETIME'].dt.year < current_year)
+    ].copy()
+    recent_complaint_counts = recent_complaints_period['MSAG_Name'].value_counts().reset_index()
+    recent_complaint_counts.columns = ['MSAG_Name', 'Recent_Complaint_Count']
+    # 3. Calculate Maintenance Age per MSAG_Name
+    latest_install_date = complaint_df.groupby('MSAG_Name')['InstallDate'].max().reset_index()
+    latest_data_date = complaint_df['OPENEDDATETIME'].max()
+    if pd.isna(latest_data_date):
+        latest_data_date = datetime.now()
+    latest_install_date['Maintenance_Age_Years'] = (latest_data_date - latest_install_date['InstallDate']).dt.days / 365.25
+    latest_install_date['Maintenance_Age_Years'] = latest_install_date['Maintenance_Age_Years'].fillna(latest_install_date['Maintenance_Age_Years'].max() * 2)
+    # 4. Merge all relevant dataframes
+    pothole_risk_df = pd.merge(pci_by_msag, recent_complaint_counts, on='MSAG_Name', how='outer')
+    pothole_risk_df = pd.merge(pothole_risk_df, latest_install_date[['MSAG_Name', 'Maintenance_Age_Years']], on='MSAG_Name', how='outer')
+    # Fill NaN values
+    pothole_risk_df['Road_Deterioration_Score'] = pothole_risk_df['Road_Deterioration_Score'].fillna(pothole_risk_df['Road_Deterioration_Score'].mean())
+    pothole_risk_df['Recent_Complaint_Count'] = pothole_risk_df['Recent_Complaint_Count'].fillna(0)
+    pothole_risk_df['Maintenance_Age_Years'] = pothole_risk_df['Maintenance_Age_Years'].fillna(pothole_risk_df['Maintenance_Age_Years'].max())
+    # 5. Create a composite Pothole Formation Risk Score (normalize and sum)
+    for col in ['Road_Deterioration_Score', 'Recent_Complaint_Count', 'Maintenance_Age_Years']:
+        min_val = pothole_risk_df[col].min()
+        max_val = pothole_risk_df[col].max()
+        if (max_val - min_val) != 0:
+            pothole_risk_df[f'{col}_Scaled'] = (pothole_risk_df[col] - min_val) / (max_val - min_val)
+        else:
+            pothole_risk_df[f'{col}_Scaled'] = 0.5
+    pothole_risk_df['Pothole_Formation_Risk_Score'] = (
+        pothole_risk_df['Road_Deterioration_Score_Scaled'] * 0.5 +
+        pothole_risk_df['Recent_Complaint_Count_Scaled'] * 0.3 +
+        pothole_risk_df['Maintenance_Age_Years_Scaled'] * 0.2
+    )
+    # Find the area (case-insensitive, partial match)
+    area_row = pothole_risk_df[pothole_risk_df['MSAG_Name'].str.contains(area, case=False, na=False)]
+    if area_row.empty:
+        return f"No risk data found for the area '{area}'. Please check the area name.", None, pd.DataFrame()
+    row = area_row.iloc[0]
+    city_avg = pothole_risk_df['Pothole_Formation_Risk_Score'].mean()
+    risk = row['Pothole_Formation_Risk_Score']
+    risk_level = "High" if risk > 0.66 else ("Moderate" if risk > 0.33 else "Low")
+    compare = "above" if risk > city_avg else ("below" if risk < city_avg else "equal to")
+    response = (
+        f"The predicted pothole formation risk for {row['MSAG_Name']} is {risk:.2f} ({risk_level}).\n"
+        f"- Deterioration: {row['Road_Deterioration_Score']:.2f}\n"
+        f"- Recent Complaints: {int(row['Recent_Complaint_Count'])}\n"
+        f"- Maintenance Age: {row['Maintenance_Age_Years']:.1f} years\n"
+        f"This is {compare} the city average risk."
+    )
+    # Optionally, highlight this area on the map
+    highlight_df = pavement_latlon_df[pavement_latlon_df['MSAG_Name'] == row['MSAG_Name']][['MSAG_Name', 'Latitude', 'Longitude']].copy()
+    highlight_df['color'] = 'blue'
+    highlight_df['marker_radius'] = 12
+    return response, None, highlight_df
+
+# --- Handler: How does weather affect formations? ---
+def handle_weather_effect():
+    response = (
+        "Weather plays a major role in pothole formation. Rain and snow allow water to seep into pavement cracks. "
+        "When temperatures drop, the water freezes and expands, causing the pavement to break apart. "
+        "Repeated freeze-thaw cycles and heavy rainfall accelerate pothole development."
+    )
+    return response, None, pd.DataFrame()
+
+# --- Handler: Why are there so many potholes? ---
+def handle_why_so_many_potholes():
+    response = (
+        "Potholes are caused by a combination of traffic wear, water infiltration, and temperature changes. "
+        "Water seeps into cracks, freezes and expands, breaking the pavement. Heavy traffic then worsens the damage. "
+        "Poor road maintenance and weather extremes can increase pothole formation."
+    )
+    return response, None, pd.DataFrame()
+
+# --- Handler: How long does it take on average for potholes to get fixed in San Antonio? ---
+def handle_avg_fix_time():
+    if pothole_cases_df.empty or 'OpenDate' not in pothole_cases_df.columns or 'CloseDate' not in pothole_cases_df.columns:
+        return "No fix time data available.", None, pd.DataFrame()
+    df = pothole_cases_df.dropna(subset=['OpenDate', 'CloseDate']).copy()
+    df['fix_time'] = (pd.to_datetime(df['CloseDate']) - pd.to_datetime(df['OpenDate'])).dt.days
+    avg_days = df['fix_time'].mean()
+    if np.isnan(avg_days):
+        return "Insufficient data to calculate average fix time.", None, pd.DataFrame()
+    return f"On average, potholes in San Antonio are fixed in {avg_days:.1f} days.", None, pd.DataFrame()
+
+# --- Handler: Which areas have the highest amount of potholes? ---
+def handle_areas_with_most_potholes(top_n=5):
+    if pothole_cases_df.empty or 'MSAG_Name' not in pothole_cases_df.columns:
+        return "No area data available.", None, pd.DataFrame()
+    area_counts = pothole_cases_df['MSAG_Name'].value_counts().head(top_n)
+    response = "Areas with the highest number of potholes:\n"
+    for i, (area, count) in enumerate(area_counts.items(), 1):
+        response += f"{i}. {area}: {count} potholes\n"
+    highlight_df = pavement_latlon_df[pavement_latlon_df['MSAG_Name'].isin(area_counts.index)][['MSAG_Name', 'Latitude', 'Longitude']].copy()
+    highlight_df['color'] = 'red'
+    highlight_df['marker_radius'] = 12
+    return response, None, highlight_df
+
+# --- Handler: How many potholes have been found this month? ---
+def handle_potholes_this_month():
+    if pothole_cases_df.empty or 'OpenDate' not in pothole_cases_df.columns:
+        return "No pothole data available.", None, pd.DataFrame()
+    now = pd.Timestamp.now()
+    this_month = pothole_cases_df[pothole_cases_df['OpenDate'].dt.month == now.month]
+    count = len(this_month)
+    return f"There have been {count} potholes reported so far this month.", None, pd.DataFrame()
+
+# --- Handler: Should I avoid [area] because of the potholes? ---
+def handle_should_avoid_area(area, threshold=10):
+    msg, _, highlight_df = handle_potholes_in_area(area)
+    match = re.search(r"(\d+)", msg)
+    count = int(match.group(1)) if match else 0
+    if count > threshold:
+        advice = f"There are {count} potholes in '{area}'. It is advisable to avoid this area if possible."
+    elif count > 0:
+        advice = f"There are {count} potholes in '{area}', but it may still be passable. Exercise caution."
+    else:
+        advice = f"No significant pothole issues detected in '{area}'. It should be safe to travel."
+    return advice, None, highlight_df
+
+# --- Handler: How many potholes are in the [area]? ---
+def handle_potholes_in_area(area):
+    lat, lon = geocode_address(area)
+    if lat is None or lon is None:
+        return f"Could not geocode the area '{area}'. Please check the area and try again.", None, pd.DataFrame()
+    gdf = get_pavement_gdf()
+    if gdf.empty:
+        return "No pavement location data available.", None, pd.DataFrame()
+    gdf_proj = gdf.to_crs(epsg=3857)
+    point = gpd.GeoSeries([gpd.points_from_xy([lon], [lat])[0]], crs="EPSG:4326").to_crs(epsg=3857)
+    buffer = point.buffer(1000)
+    in_area = gdf_proj[gdf_proj.geometry.within(buffer.iloc[0])]
+    count = len(in_area)
+    if count == 0:
+        return f"No potholes found in '{area}'.", None, pd.DataFrame()
+    highlight_df = in_area.to_crs(epsg=4326)[["Latitude", "Longitude", "MSAG_Name"]].copy()
+    highlight_df["color"] = "orange"
+    highlight_df["marker_radius"] = 10
+    return f"There are {count} pothole(s) in '{area}'.", None, highlight_df
+
+# --- Update get_groq_response for dual logic ---
 def get_groq_response(prompt):
     prompt_lower = prompt.lower()
     plot_object = None
     highlight_data_df = pd.DataFrame() # Initialize empty DataFrame for map highlighting
 
+    # --- Area-specific pothole formation prediction ---
+    match = re.search(r"how likely (will|could) potholes form (on|in|along|at) ([^?]+)", prompt_lower)
+    if match:
+        area = match.group(3).strip()
+        return handle_pothole_formation_prediction_area(area)
+    # --- General city-wide prediction ---
+    if re.search(r"how likely (will|could) potholes form( in san antonio)?", prompt_lower):
+        return get_pothole_formation_prediction()
+    # --- Optimized intent detection for all questions ---
+    # 1. Are there potholes near [address]?
+    match = re.search(r"potholes? near ([^?]+)", prompt_lower)
+    if match:
+        address = match.group(1).strip()
+        return handle_potholes_near_address(address)
+    # 2. Will I face potholes on the way to [area]?
+    match = re.search(r"potholes? (on|along|on the way to|on my way to|on route to|on the way) ([^?]+)", prompt_lower)
+    if match:
+        area = match.group(2).strip()
+        return handle_potholes_on_route(area)
+    # 3. How many potholes are in the [area]?
+    match = re.search(r"how many potholes (are )?(in|at|within) ([^?]+)", prompt_lower)
+    if match:
+        area = match.group(3).strip()
+        return handle_potholes_in_area(area)
+    # 4. Should I avoid [area] because of the potholes?
+    match = re.search(r"should i avoid ([^?]+) because of (the )?potholes", prompt_lower)
+    if match:
+        area = match.group(1).strip()
+        return handle_should_avoid_area(area)
+    # 5. How many potholes have been found this month?
+    if re.search(r"(how many|number of) potholes (have been )?(found|reported)? ?(this|in the current) month", prompt_lower):
+        return handle_potholes_this_month()
+    # 6. Which areas have the highest amount of potholes?
+    if re.search(r"which areas? (have|has) (the )?(highest|most) (amount|number) of potholes", prompt_lower):
+        return handle_areas_with_most_potholes()
+    # 7. Display streets with the worst potholes
+    if re.search(r"(display|show) streets? (with|having) (the )?worst potholes", prompt_lower):
+        return get_worst_pothole_streets()
+    # 8. How long does it take on average for potholes to get fixed in san antonio\??", prompt_lower):
+    if re.search(r"how long does it take (on average )?for potholes to get fixed( in san antonio)?", prompt_lower):
+        return handle_avg_fix_time()
+    # 9. How likely will potholes form on this route/street/area?
+    if re.search(r"how likely (will|could) potholes form (on|in|along|at) (this|the|a)? ?(route|street|area)?", prompt_lower):
+        return get_pothole_formation_prediction()
+    # 10. Why are there so many potholes?
+    if re.search(r"why (are|is) (there )?so many potholes", prompt_lower):
+        return handle_why_so_many_potholes()
+    # 11. How does weather affect formations?
+    if re.search(r"how does weather affect (pothole )?formation(s)?", prompt_lower):
+        return handle_weather_effect()
+
+    # --- Safety & Prevention Questions ---
+    if re.search(r'active pothole complaints.*school|senior|hospital', prompt_lower):
+        return handle_active_complaints_near_sensitive_areas()
+    if re.search(r'intersections? with via stops.*pothole.*injur', prompt_lower):
+        return handle_intersections_via_pothole_injury()
+    if re.search(r'preventative maintenance.*bus|damage|delay', prompt_lower):
+        return handle_prioritize_maintenance_for_buses()
+    match = re.search(r'history of repeated pothole complaints.*along (.+)', prompt_lower)
+    if match:
+        road = match.group(1).strip()
+        return handle_repeated_complaints_on_road(road)
+    if re.search(r'bus stops.*high[- ]?risk pavement', prompt_lower):
+        return handle_bus_stops_near_high_risk_pavement()
+
+    # --- Existing logic for other questions ---
     # Check for new, more specific analytical questions
     if "pavement condition for" in prompt_lower or "potholes on" in prompt_lower:
         match = re.search(r'(pavement condition for|potholes on)\s+(.+)', prompt_lower)
