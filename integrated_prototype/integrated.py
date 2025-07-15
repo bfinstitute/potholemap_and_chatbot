@@ -1,8 +1,7 @@
+import pandas as pd
 import streamlit as st
 import folium
 import geopandas as gpd
-import pandas as pd
-from streamlit_folium import st_folium
 import requests
 import json
 import os
@@ -13,6 +12,8 @@ import seaborn as sns
 import numpy as np
 import hashlib
 from functools import lru_cache
+from streamlit_folium import st_folium
+import inspect
 
 global pothole_cases_df, pavement_latlon_df, complaint_df # Declare globals here
 
@@ -67,6 +68,27 @@ injuries_df = pd.DataFrame(columns=['intersection', 'lat', 'lon', 'injury_count'
 via_stops_df = pd.read_csv('Data/VIA/stops_cleaned.csv')
 via_routes_df = pd.read_csv('Data/VIA/via_routes_cleaned.csv')
 
+# --- Load sensitive locations from extracted CSV ---
+import re
+try:
+    sensitive_locations_df = pd.read_csv('Data/possible_sensitive_locations.csv')
+    # Extract lat/lon from GoogleMapView column
+    def extract_lat_lon(url):
+        if pd.isna(url) or url == 'Not Available':
+            return None, None
+        match = re.search(r'place/(\d+\.\d+)N (\d+\.\d+)W', url)
+        if match:
+            lat = float(match.group(1))
+            lon = -float(match.group(2))  # West is negative
+            return lat, lon
+        return None, None
+    sensitive_locations_df[['lat', 'lon']] = sensitive_locations_df['GoogleMapView'].apply(lambda x: pd.Series(extract_lat_lon(x)))
+    sensitive_locations_df = sensitive_locations_df.dropna(subset=['lat', 'lon', 'MSAG_Name'])
+    sensitive_locations_df = sensitive_locations_df.rename(columns={'MSAG_Name': 'name'})
+    sensitive_locations_df = sensitive_locations_df[['name', 'lat', 'lon']]
+except Exception as e:
+    sensitive_locations_df = pd.DataFrame(columns=['name','lat','lon'])
+
 # --- Utility: Geospatial join (point-in-radius) ---
 def points_within_radius(points_df, center_lat, center_lon, radius_m):
     gdf_points = gpd.GeoDataFrame(points_df.copy(), geometry=gpd.points_from_xy(points_df.lon, points_df.lat), crs='EPSG:4326')
@@ -106,37 +128,50 @@ def get_pavement_gdf():
             get_pavement_gdf.gdf = gpd.GeoDataFrame()
     return get_pavement_gdf.gdf
 
-# --- Handler: Active pothole complaints near school zones, senior centers, hospitals ---
-def handle_active_complaints_near_sensitive_areas(radius_m=300):
+# --- Improved Handler: Active pothole complaints within the area of a school zone, senior center, or hospital ---
+def handle_active_complaints_near_sensitive_areas(radius_m=300, sensitive_type='school'):
+    # Map user type to possible keywords in the name
+    type_keywords = {
+        'school': ['school'],
+        'hospital': ['hospital', 'medical', 'clinic'],
+        'senior': ['senior', 'elder', 'center', 'elderberry', 'elderwood', 'elderpath']
+    }
+    keywords = type_keywords.get(sensitive_type, [sensitive_type])
     # Filter unresolved complaints (active)
     if complaint_df.empty or 'Latitude' not in complaint_df.columns or 'Longitude' not in complaint_df.columns:
         return "Complaint data with location is required for this analysis.", None, pd.DataFrame()
     unresolved = complaint_df[complaint_df['CLOSEDDATETIME'].isna() & complaint_df['Latitude'].notna() & complaint_df['Longitude'].notna()]
-    # Combine all sensitive locations
-    sensitive = pd.concat([
-        schools_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'}),
-        hospitals_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'}),
-        senior_centers_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'})
-    ], ignore_index=True)
+    print(f"DEBUG: Number of unresolved complaints: {len(unresolved)}")
+    # Use extracted sensitive locations, filter for any keyword in name
+    pattern = '|'.join(keywords)
+    sensitive = sensitive_locations_df[sensitive_locations_df['name'].str.contains(pattern, case=False, na=False)].copy()
+    print(f"DEBUG: Number of sensitive locations ({sensitive_type}): {len(sensitive)}")
     if sensitive.empty:
-        return "No sensitive location data (schools, hospitals, senior centers) available.", None, pd.DataFrame()
-    # For each sensitive location, find complaints within radius
-    results = []
+        return f"No sensitive {sensitive_type} location data available.", None, pd.DataFrame()
+    summary = []
+    highlight_rows = []
     for _, row in sensitive.iterrows():
-        near = unresolved[((unresolved['Latitude'] - row['Latitude'])**2 + (unresolved['Longitude'] - row['Longitude'])**2).pow(0.5) < (radius_m/111320)]
-        for _, c in near.iterrows():
-            results.append({
-                'Sensitive': row['name'],
-                'ComplaintID': c.get('ComplaintID', ''),
-                'Latitude': c['Latitude'],
-                'Longitude': c['Longitude']
-            })
-    if not results:
-        return "No active pothole complaints found near school zones, senior centers, or hospitals.", None, pd.DataFrame()
-    highlight_df = pd.DataFrame(results)
-    highlight_df['color'] = 'red'
-    highlight_df['marker_radius'] = 10
-    return f"Found {len(highlight_df)} active pothole complaints near sensitive areas.", None, highlight_df
+        lat, lon, name = row['lat'], row['lon'], row['name']
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        near = unresolved[((unresolved['Latitude'] - float(lat))**2 + (unresolved['Longitude'] - float(lon))**2).pow(0.5) < (radius_m/111320)]
+        count = len(near)
+        if count > 0:
+            summary.append(f"{count} active complaint(s) near {name}")
+            for _, c in near.iterrows():
+                highlight_rows.append({
+                    'Sensitive': name,
+                    'ComplaintID': c.get('ComplaintID', ''),
+                    'Latitude': c['Latitude'],
+                    'Longitude': c['Longitude'],
+                    'color': 'red',
+                    'marker_radius': 10
+                })
+    if not summary:
+        return f"No active pothole complaints found near any {sensitive_type} zone.", None, pd.DataFrame()
+    highlight_df = pd.DataFrame(highlight_rows)
+    response = f"Active pothole complaints near {sensitive_type} zones: " + "; ".join(summary)
+    return response, None, highlight_df
 
 # --- Handler: Intersections with VIA stops, high pothole & injury rates ---
 def handle_intersections_via_pothole_injury(top_n=5):
@@ -683,7 +718,76 @@ def handle_potholes_in_area(area):
     highlight_df["marker_radius"] = 10
     return f"There are {count} pothole(s) in '{area}'.", None, highlight_df
 
-# --- Update get_groq_response for dual logic ---
+# --- Handler: Any pothole complaints near school zones? ---
+def handle_any_complaints_near_sensitive_areas(radius_m=300, sensitive_type='school'):
+    # Map user type to possible keywords in the name
+    type_keywords = {
+        'school': ['school'],
+        'hospital': ['hospital', 'medical', 'clinic'],
+        'senior': ['senior', 'elder', 'center', 'elderberry', 'elderwood', 'elderpath']
+    }
+    keywords = type_keywords.get(sensitive_type, [sensitive_type])
+    if complaint_df.empty or 'Latitude' not in complaint_df.columns or 'Longitude' not in complaint_df.columns:
+        return "Complaint data with location is required for this analysis.", None, pd.DataFrame()
+    all_complaints = complaint_df[complaint_df['Latitude'].notna() & complaint_df['Longitude'].notna()]
+    print(f"DEBUG: Number of total complaints: {len(all_complaints)}")
+    pattern = '|'.join(keywords)
+    sensitive = sensitive_locations_df[sensitive_locations_df['name'].str.contains(pattern, case=False, na=False)].copy()
+    print(f"DEBUG: Number of sensitive locations ({sensitive_type}): {len(sensitive)}")
+    if sensitive.empty:
+        return f"No sensitive {sensitive_type} location data available.", None, pd.DataFrame()
+    sensitive_unique = sensitive.drop_duplicates(subset=['name', 'lat', 'lon'])
+    summary = []
+    highlight_rows = []
+    for _, row in sensitive_unique.iterrows():
+        lat, lon, name = row['lat'], row['lon'], row['name']
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        near = all_complaints[((all_complaints['Latitude'] - float(lat))**2 + (all_complaints['Longitude'] - float(lon))**2).pow(0.5) < (radius_m/111320)]
+        count = len(near)
+        if count > 0:
+            summary.append(f"{count} complaint(s) near {name} ({lat:.5f}, {lon:.5f})")
+            marker_radius = min(25, 8 + count // 2)
+            if count >= 30:
+                marker_color = 'darkred'
+            elif count >= 20:
+                marker_color = 'red'
+            elif count >= 10:
+                marker_color = 'orange'
+            else:
+                marker_color = 'yellow'
+            for _, c in near.iterrows():
+                highlight_rows.append({
+                    'Sensitive': name,
+                    'ComplaintID': c.get('ComplaintID', ''),
+                    'Latitude': c['Latitude'],
+                    'Longitude': c['Longitude'],
+                    'color': marker_color,
+                    'marker_radius': marker_radius,
+                    'ComplaintCount': count
+                })
+    if not summary:
+        return f"No pothole complaints found near any {sensitive_type} zone.", None, pd.DataFrame()
+    highlight_df = pd.DataFrame(highlight_rows)
+    response = f"Pothole complaints near {sensitive_type} zones: " + "; ".join(summary)
+    response += "\n\nMarker color/size indicates complaint count: yellow (<10), orange (10-19), red (20-29), darkred (30+). Larger markers = more complaints."
+    return response, None, highlight_df
+
+# --- RAG Query Integration ---
+from rag_tool import query_table
+
+# Simple parser for street and year from user question
+def parse_rag_question(question):
+    import re
+    street = None
+    year = None
+    m = re.search(r'on ([\w\s]+) in (\d{4})', question)
+    if m:
+        street = m.group(1).strip()
+        year = int(m.group(2))
+    return street, year
+
+# --- Update get_groq_response to use RAG as fallback ---
 def get_groq_response(prompt):
     prompt_lower = prompt.lower()
     plot_object = None
@@ -741,18 +845,68 @@ def get_groq_response(prompt):
         return handle_weather_effect()
 
     # --- Safety & Prevention Questions ---
-    if re.search(r'active pothole complaints.*school|senior|hospital', prompt_lower):
-        return handle_active_complaints_near_sensitive_areas()
+    match = re.search(r'active pothole complaints.*(school|senior|hospital)', prompt_lower)
+    if match:
+        sensitive_type = match.group(1)
+        # Normalize to match our type_keywords
+        if 'school' in sensitive_type:
+            sensitive_type = 'school'
+        elif 'hospital' in sensitive_type or 'medical' in sensitive_type or 'clinic' in sensitive_type:
+            sensitive_type = 'hospital'
+        elif 'senior' in sensitive_type or 'elder' in sensitive_type or 'center' in sensitive_type:
+            sensitive_type = 'senior'
+        return handle_active_complaints_near_sensitive_areas(sensitive_type=sensitive_type)
     if re.search(r'intersections? with via stops.*pothole.*injur', prompt_lower):
         return handle_intersections_via_pothole_injury()
     if re.search(r'preventative maintenance.*bus|damage|delay', prompt_lower):
         return handle_prioritize_maintenance_for_buses()
     match = re.search(r'history of repeated pothole complaints.*along (.+)', prompt_lower)
     if match:
+        road = match.group(1).strip(' ?')
+        return handle_repeated_complaints_on_road(road)
+    # Also match: 'Is there a history of repeated pothole complaints along the [road]?' (with [road] in brackets or as a phrase)
+    match = re.search(r'is there a history of repeated pothole complaints along (?:the )?\[?([\w\s\-\.]+)\]?', prompt_lower)
+    if match:
         road = match.group(1).strip()
         return handle_repeated_complaints_on_road(road)
     if re.search(r'bus stops.*high[- ]?risk pavement', prompt_lower):
         return handle_bus_stops_near_high_risk_pavement()
+    match = re.search(r'any pothole complaints.*(school|senior|hospital)', prompt_lower)
+    if match:
+        sensitive_type = match.group(1)
+        if 'school' in sensitive_type:
+            sensitive_type = 'school'
+        elif 'hospital' in sensitive_type or 'medical' in sensitive_type or 'clinic' in sensitive_type:
+            sensitive_type = 'hospital'
+        elif 'senior' in sensitive_type or 'elder' in sensitive_type or 'center' in sensitive_type:
+            sensitive_type = 'senior'
+        return handle_any_complaints_near_sensitive_areas(sensitive_type=sensitive_type)
+
+    # --- RAG fallback: try to parse and answer with query_table ---
+    street, year = parse_rag_question(prompt)
+    if street and year:
+        print(f"[RAG] Using RAG for street='{street}', year={year}")
+        st.write(f"[DEBUG] RAG Query: street='{street}', year={year}")
+        # Print the SQL and params if possible
+        # (If query_table prints them, they will show in Streamlit logs)
+        results = query_table(street=street, year=year)
+        st.write(f"[DEBUG] RAG Results: {results}")
+        if results:
+            # Count all records, and optionally show a breakdown by street_name
+            df = pd.DataFrame(results, columns=["latitude", "longitude", "street_name", "year", "council_district"])
+            # Standardize for mapping
+            df = df.rename(columns={
+                'latitude': 'Latitude',
+                'longitude': 'Longitude',
+                'street_name': 'MSAG_Name'
+            })
+            total = len(df)
+            breakdown = df['MSAG_Name'].value_counts().to_dict()
+            breakdown_str = "; ".join([f"{k}: {v}" for k, v in breakdown.items()])
+            response = f"Found {total} pothole records for streets containing '{street}' in {year}.\nBreakdown: {breakdown_str}"
+            return response, None, df
+        else:
+            return f"No pothole records found for streets containing '{street}' in {year}.", None, pd.DataFrame()
 
     # --- Existing logic for other questions ---
     # Check for new, more specific analytical questions
@@ -858,6 +1012,15 @@ def add_pothole_markers(df, folium_map, feature_group, color_column='color', mar
     for _, row in df.iterrows():
         if pd.notna(row['Latitude']) and pd.notna(row['Longitude']):
             marker_color = row[color_column] if color_column in row else 'blue' # Default to blue if no color column
+            # Use the best available name for tooltip
+            if 'MSAG_Name' in row:
+                tooltip_name = row['MSAG_Name']
+            elif 'Sensitive' in row:
+                tooltip_name = row['Sensitive']
+            elif 'name' in row:
+                tooltip_name = row['name']
+            else:
+                tooltip_name = 'Location'
             folium.CircleMarker(
                 location=[row.Latitude, row.Longitude],
                 radius=int(marker_radius),  # Ensure radius is a standard Python int
@@ -865,7 +1028,7 @@ def add_pothole_markers(df, folium_map, feature_group, color_column='color', mar
                 fill=True,
                 fill_color=marker_color,
                 fill_opacity=0.7,
-                tooltip=f"{row['MSAG_Name']}: {row.get('ComplaintCount', 'N/A')} Complaints",
+                tooltip=f"{tooltip_name}: {row.get('ComplaintCount', 'N/A')} Complaints",
             ).add_to(feature_group)
     return feature_group # Return the feature group
 
